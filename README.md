@@ -25,6 +25,8 @@ window — into spoken audio with Play / Pause / Stop / Export controls.
 .
 ├─ main.py                  # entry point (creates window + event loop)
 ├─ requirements.txt
+├─ tts_app.spec             # PyInstaller config (builds the single-file .exe)
+├─ build_windows.bat        # one-click Windows installer build script
 └─ tts_app/
    ├─ tts_engine.py           # Voice/TtsError + engine abstraction, edge-tts & pyttsx3
    ├─ audio_player.py          # QtMultimedia QMediaPlayer wrapper (progress)
@@ -51,3 +53,21 @@ python -m tts_app.tts_engine "Hello from the CLI"
 
 This enumerates the voice catalog, prints a sample of voices, and writes a test
 MP3 to the system temp directory.
+
+## Building a standalone .exe (for a friend's Windows laptop)
+
+An executable only runs on the OS it was built *on*. I've provided everything
+needed to produce a single-file, no-install Windows `.exe`. Take this whole
+folder to a Windows machine and:
+
+1. Copy the project folder (it contains `tts_app.spec`, `build_windows.bat`,
+   `requirements.txt`, and the `tts_app/` package).
+2. Double-click **`build_windows.bat`**. It will:
+   - create a venv,
+   - install the dependencies plus PyInstaller,
+   - build `dist\TTSApp.exe` using `tts_app.spec`.
+3. Grab **`dist\TTSApp.exe`** — copy it onto your friend's computer and run it.
+   No Python or installation is required on their machine.
+
+> The `.spec` already bundles the PyQt5 plugins and all edge-tts/pyttsx3
+> dependencies, and builds with the console window hidden.
