@@ -207,10 +207,19 @@ class BaseTtsEngine:
 
     The shared logic caches the voice catalogue as ``Voice`` objects. Lists
     (languages, voices, genders) are all derived from that catalogue.
+
+    Engines whose voice comes from a user-supplied *reference sample* instead
+    of a fixed catalogue (e.g. voice cloning) set ``has_voice_catalog`` to
+    ``False``; the GUI then shows a "voice sample" picker instead of the
+    voice dropdown.
     """
 
     #: Short label shown in the engine selector dropdown.
     label = "Base"
+
+    #: True when voices come from a fixed catalogue; False when the voice is
+    #: cloned from a user-supplied audio sample.
+    has_voice_catalog = True
 
     def __init__(self) -> None:
         #: list of :class:`Voice`; cached after the first call.
@@ -412,6 +421,94 @@ def _wave_path(path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# XTTS v2 engine (local voice cloning)
+# ---------------------------------------------------------------------------
+
+
+class XttsEngine(BaseTtsEngine):
+    """Coqui XTTS v2 backend: clone *any* voice from a short reference sample.
+
+    This is a zero-shot voice-cloning model (no training needed). The user
+    provides 6-30s of clear speech in an audio file, and every utterance is
+    synthesised in that voice. The voice is therefore *not* part of a fixed
+    catalogue — ``has_voice_catalog`` is ``False`` and the caller must supply
+    the reference sample's path (carried inside the ``Voice.id``).
+
+    The model (~1.8 GB) is downloaded on first use and kept loaded for the
+    rest of the process, so the first synthesis is slow but later ones are
+    fast. Requires the optional ``coqui-tts`` + PyTorch install; when absent
+    this engine is silently skipped by :func:`available_engines`.
+    """
+
+    label = "XTTS v2 (your voice)"
+
+    has_voice_catalog = False
+
+    #: The 17 languages XTTS v2 was trained on.
+    _LANGUAGES = [
+        "ar", "cs", "de", "en", "es", "fr", "hi", "hu", "it",
+        "ja", "ko", "nl", "pl", "pt", "ru", "tr", "zh",
+    ]
+
+    def __init__(self) -> None:
+        super().__init__()
+        #: lazily-loaded TTS.api.TTS instance; None until first synthesis.
+        self._model = None
+
+    def list_languages(self) -> _t.List[str]:
+        """XTTS only supports the 17 languages it was trained on."""
+        return list(self._LANGUAGES)
+
+    def list_voices(self, language: str = "") -> _t.List[Voice]:
+        """XTTS has no fixed catalogue — every voice is the user's sample."""
+        return []
+
+    def _discover(self) -> _t.List[Voice]:
+        return []
+
+    def voices(self) -> _t.List[Voice]:
+        return []
+
+    def synthesize_to_file(self, text, voice, output_path) -> str:
+        """Synthesise ``text`` using ``voice.id`` as the reference sample.
+
+        ``voice.id`` must be a path to a readable audio file (ideally a WAV
+        with 6-30s of clear speech) and ``voice.locale`` one of the supported
+        languages.
+        """
+        if not voice.id or not os.path.isfile(voice.id):
+            raise TtsError(
+                "Pick a voice sample first: record 6-30 seconds of clear "
+                "speech (WAV or MP3) and select the file below."
+            )
+        import torch
+        from TTS.api import TTS as TtsApi
+
+        model = self._model
+        if model is None:
+            # XTTS ships under the non-commercial Coqui Public Model License;
+            # auto-accept its ToS so the model can download headlessly (the
+            # GUI thread has no stdin to answer the prompt with).
+            os.environ.setdefault("COQUI_TOS_AGREED", "1")
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            model = TtsApi("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
+            self._model = model
+
+        output_path = _wave_path(output_path)
+        language = voice.locale or "en"
+        try:
+            model.tts_to_file(
+                text=text,
+                speaker_wav=voice.id,
+                language=language,
+                file_path=output_path,
+            )
+        except Exception as exc:
+            raise TtsError(f"XTTS failed: {exc}") from exc
+        return output_path
+
+
+# ---------------------------------------------------------------------------
 # Engine registry
 # ---------------------------------------------------------------------------
 
@@ -432,6 +529,14 @@ def available_engines() -> _t.List[BaseTtsEngine]:
         import pyttsx3  # noqa: F401  (availability probe)
 
         engines.append(Pyttsx3Engine())
+    except Exception:
+        pass
+    try:
+        # Cheap probe: importing TTS would pull in torch (~seconds) at startup.
+        import importlib.util
+
+        if importlib.util.find_spec("TTS") is not None:
+            engines.append(XttsEngine())
     except Exception:
         pass
     if not engines:

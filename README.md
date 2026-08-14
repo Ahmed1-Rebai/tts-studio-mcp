@@ -11,6 +11,9 @@ window — into spoken audio with Play / Pause / Stop / Export controls.
     clear male/female voices per language, natural neural quality.
   - **pyttsx3 (offline)** — fully offline, uses the OS/espeak system voices.
     Used as a fallback when there is no internet.
+  - **XTTS v2 (your voice)** — *optional*. Clones your voice from a short
+    recording (6-30s), then speaks any text in it. Runs fully offline.
+    See ["Voice cloning"](#voice-cloning) below.
 - Choose a **language** (dropdown populated from the selected engine).
 - Filter voices by **gender** (Male / Female) and **age** (Adult / Child) when
   the engine exposes that metadata.
@@ -25,14 +28,19 @@ window — into spoken audio with Play / Pause / Stop / Export controls.
 .
 ├─ main.py                  # entry point (creates window + event loop)
 ├─ requirements.txt
+├─ requirements-xtts.txt    # optional voice-cloning deps (Coqui XTTS + PyTorch)
 ├─ tts_app.spec             # PyInstaller config (builds the single-file .exe)
 ├─ build_windows.bat        # one-click Windows installer build script
 └─ tts_app/
-   ├─ tts_engine.py           # Voice/TtsError + engine abstraction, edge-tts & pyttsx3
+   ├─ tts_engine.py           # Voice/TtsError + engine abstraction: edge-tts,
+   │                          #   pyttsx3 and XTTS v2 (voice cloning)
    ├─ audio_player.py          # QtMultimedia QMediaPlayer wrapper (progress)
    │                           #    + signal-based state relayed to GUI
    └─ gui.py                   # MainWindow: all widgets & drop-down logic
 ```
+
+> The Windows `.exe` build bundles `edge-tts` and `pyttsx3` only — XTTS/PyTorch
+> stays an optional, on-machine install so the exe stays small.
 
 ## Setup & run
 
@@ -42,6 +50,42 @@ source venv/bin/activate          # (or venv\Scripts\activate on Windows)
 pip install -r requirements.txt
 python main.py
 ```
+
+## Voice cloning (XTTS v2)
+
+The app can speak with **your voice**. It uses Coqui XTTS v2, a local
+zero-shot voice-cloning model — no training required. Because it pulls in
+PyTorch (~2 GB), it's an optional install:
+
+```bash
+# CPU (Linux/macOS/Windows):
+pip install torch torchaudio torchcodec --index-url https://download.pytorch.org/whl/cpu
+pip install -r requirements-xtts.txt
+```
+
+(For a GPU, install torch/torchaudio/torchcodec from https://pytorch.org
+first, then `pip install coqui-tts`.)
+
+Then:
+
+1. Pick **XTTS v2 (your voice)** from the engine dropdown.
+2. Click **Record** to capture your voice straight from the microphone, or
+   **Choose voice sample…** to load a recording — ideally 6-30 s of clear,
+   quiet speech (WAV or MP3).
+3. Type text and hit **Play**.
+
+Notes:
+
+- The model (~1.8 GB) downloads automatically on the first synthesis; the
+  first run also takes a few tens of seconds to load. Later runs are fast.
+- XTTS supports 17 languages: Arabic, Czech, German, English, Spanish,
+  French, Hindi, Hungarian, Italian, Japanese, Korean, Dutch, Polish,
+  Portuguese, Russian, Turkish, Chinese.
+- Export saves **WAV** (XTTS does not encode MP3).
+- Cloning uses the [Coqui Public Model License](https://coqui.ai/cpml)
+  (non-commercial); using the engine implies agreeing to its terms.
+- `edge-tts` and `pyttsx3` work without this install — the XTTS engine only
+  appears in the dropdown once `coqui-tts` is installed.
 
 ## Command-line smoke test
 

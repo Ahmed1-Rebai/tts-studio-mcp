@@ -37,7 +37,23 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["tkinter"],
+    # Keep the optional XTTS voice-cloning stack out of the binary — it is
+    # imported lazily at runtime and would add ~2 GB if bundled. Without these
+    # excludes PyInstaller would statically discover `import torch` inside
+    # tts_engine.py and drag the whole stack in.
+    excludes=[
+        "tkinter",
+        "torch",
+        "torchaudio",
+        "torchcodec",
+        "torchvision",
+        "TTS",
+        "transformers",
+        "librosa",
+        "numba",
+        "soundfile",
+        "scipy",
+    ],
     noarchive=False,
 )
 pyz = PYZ(a.pure)

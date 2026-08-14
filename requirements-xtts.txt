@@ -1,0 +1,18 @@
+# Optional voice-cloning engine (Coqui XTTS v2).
+# Install only if you want the "your voice" feature:
+#
+#   CPU (Linux/macOS/Windows):
+#     pip install torch torchaudio torchcodec --index-url https://download.pytorch.org/whl/cpu
+#     pip install -r requirements-xtts.txt
+#
+# For GPU, install torch/torchaudio/torchcodec from https://pytorch.org first,
+# then `pip install coqui-tts`.
+#
+# The XTTS model (~1.8 GB) is downloaded automatically on first synthesis.
+
+torch
+torchaudio
+torchcodec
+coqui-tts
+# coqui-tts is not yet compatible with transformers 5.x
+transformers<5

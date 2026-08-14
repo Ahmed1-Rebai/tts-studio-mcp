@@ -3,7 +3,9 @@
 The window guides the user through:
 
     1. Picking an engine and a language (dropdowns populated dynamically).
-    2. Filtering the generated voice list by gender and age.
+    2. Filtering the generated voice list by gender and age, or — when using
+       a voice-cloning engine such as XTTS — providing a reference audio
+       sample of the voice to clone.
     3. Entering text — either pasted/typed into the text box or loaded from a
        .txt file.
     4. Play / Pause / Stop with a progress slider, plus Export to MP3/WAV.
@@ -18,8 +20,14 @@ import os
 import tempfile
 import typing as _t
 
-from PyQt5.QtCore import QThread, Qt, pyqtSignal
+from PyQt5.QtCore import QThread, Qt, QUrl, pyqtSignal
 from PyQt5.QtGui import QFont
+from PyQt5.QtMultimedia import (
+    QAudioEncoderSettings,
+    QAudioRecorder,
+    QMediaRecorder,
+    QMultimedia,
+)
 from PyQt5.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -32,6 +40,7 @@ from PyQt5.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QSlider,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -40,8 +49,10 @@ from tts_app.audio_player import AudioPlayer, PAUSED, PLAYING
 from tts_app.tts_engine import (
     BaseTtsEngine,
     TtsError,
+    Voice,
     available_engines,
     language_display_name,
+    language_subtag,
 )
 
 _ANY = "Any"
@@ -90,6 +101,12 @@ class MainWindow(QMainWindow):
         self._playable_path = None
         self._scrubbing = False
 
+        #: path of the user's reference audio for voice-cloning engines.
+        self._sample_path = None
+        #: active QAudioRecorder (None when not recording) and its target file.
+        self._recorder = None
+        self._record_path = None
+
         self._build_ui()
         self._wire_signals()
         self._seed_engine()
@@ -136,9 +153,14 @@ class MainWindow(QMainWindow):
         self._language_combo = QComboBox()
         form.addRow("Language:", self._language_combo)
 
-        self._voice_combo = QComboBox()
-        form.addRow("Voice:", self._voice_combo)
+        # -- Voice catalog vs. voice sample (stacked, swapped per engine) ----
+        self._voice_stack = QStackedWidget()
 
+        catalog_page = QWidget()
+        cv = QVBoxLayout(catalog_page)
+        cv.setContentsMargins(0, 0, 0, 0)
+        self._voice_combo = QComboBox()
+        cv.addWidget(self._voice_combo)
         filters = QHBoxLayout()
         filters.addWidget(QLabel("Gender:"))
         self._gender_combo = QComboBox()
@@ -148,7 +170,31 @@ class MainWindow(QMainWindow):
         self._age_combo = QComboBox()
         filters.addWidget(self._age_combo)
         filters.addStretch(1)
-        form.addRow("Filter:", filters)
+        cv.addLayout(filters)
+        self._voice_stack.addWidget(catalog_page)
+
+        sample_page = QWidget()
+        sv = QVBoxLayout(sample_page)
+        sv.setContentsMargins(0, 0, 0, 0)
+        sample = QHBoxLayout()
+        self._btn_sample = QPushButton("Choose voice sample\u2026")
+        self._btn_record = QPushButton("Record")
+        self._sample_label = QLabel("No sample selected")
+        self._sample_label.setStyleSheet("color: #777;")
+        sample.addWidget(self._btn_sample)
+        sample.addWidget(self._btn_record)
+        sample.addWidget(self._sample_label, 1)
+        sv.addLayout(sample)
+        self._sample_hint = QLabel(
+            "Record 6-30 seconds of clear, quiet speech (WAV or MP3). The "
+            "first synthesis downloads the model (~1.8 GB)."
+        )
+        self._sample_hint.setWordWrap(True)
+        self._sample_hint.setStyleSheet("color: #777;")
+        sv.addWidget(self._sample_hint)
+        self._voice_stack.addWidget(sample_page)
+
+        form.addRow("Voice:", self._voice_stack)
         layout.addWidget(voice_box)
 
         # -- Playback ----------------------------------------------------------
@@ -179,6 +225,8 @@ class MainWindow(QMainWindow):
 
     def _wire_signals(self) -> None:
         self._btn_load.clicked.connect(self.on_load_file)
+        self._btn_sample.clicked.connect(self.on_choose_sample)
+        self._btn_record.clicked.connect(self.on_record)
         self._btn_play.clicked.connect(self.on_play)
         self._btn_pause.clicked.connect(self._player.pause)
         self._btn_stop.clicked.connect(self.on_stop)
@@ -214,7 +262,15 @@ class MainWindow(QMainWindow):
         languages = engine.list_languages()
         self._block_set_items_voices(self._language_combo, languages)
         if languages:
-            self._populate_for_language(languages[0])
+            default = languages.index("en") if "en" in languages else 0
+            self._language_combo.setCurrentIndex(default)
+            self._populate_for_language(languages[default])
+        self._update_voice_ui()
+
+    def _update_voice_ui(self) -> None:
+        """Swap the voice catalogue for a voice-sample picker when needed."""
+        index = 0 if self.current_engine().has_voice_catalog else 1
+        self._voice_stack.setCurrentIndex(index)
 
     def _selected_language(self) -> str:
         """The current language subtag (from the combo's userData)."""
@@ -274,6 +330,16 @@ class MainWindow(QMainWindow):
         combo.blockSignals(False)
 
     def selected_voice(self):
+        if not self.current_engine().has_voice_catalog:
+            if not self._sample_path:
+                return None
+            return Voice(
+                voice_id=self._sample_path,
+                name=os.path.basename(self._sample_path),
+                locale=language_subtag(self._selected_language()),
+                gender="Unknown",
+                age="Adult",
+            )
         return self._voice_combo.currentData() if self._voice_combo.count() else None
 
     # ----------------------------------------------------------------- #
@@ -296,10 +362,65 @@ class MainWindow(QMainWindow):
         self._file_label.setText(path)
         self._status.setText(f"Loaded {os.path.basename(path)}")
 
+    def on_choose_sample(self) -> None:
+        """Pick the reference audio used to clone the user's voice."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select a voice sample", "",
+            "Audio files (*.wav *.mp3 *.flac *.ogg);;All files (*)",
+        )
+        if not path:
+            return
+        self._sample_path = path
+        self._sample_label.setText(os.path.basename(path))
+        self._sample_label.setStyleSheet("color: #000;")
+        self._status.setText(f"Voice sample: {os.path.basename(path)}")
+
+    def on_record(self) -> None:
+        """Toggle microphone recording of a voice sample (saved as WAV)."""
+        rec = self._recorder
+        if rec is not None and rec.state() == QMediaRecorder.RecordingState:
+            rec.stop()
+            return
+
+        path = _new_tmp_path(".wav")
+        rec = QAudioRecorder(self)
+        settings = QAudioEncoderSettings()
+        settings.setCodec("audio/x-raw")  # PCM
+        settings.setSampleRate(44100)
+        settings.setChannelCount(1)
+        settings.setQuality(QMultimedia.HighQuality)
+        rec.setEncodingSettings(settings, container="audio/x-wav")
+        rec.setOutputLocation(QUrl.fromLocalFile(path))
+        rec.stateChanged.connect(self._on_record_state)
+        rec.error.connect(self._on_record_error)
+        self._recorder = rec
+        self._record_path = path
+        rec.record()
+        self._btn_record.setText("Stop recording")
+        self._status.setText("Recording\u2026 click Stop when done")
+
+    def _on_record_state(self, state: int) -> None:
+        if state != QMediaRecorder.StoppedState:
+            return
+        self._btn_record.setText("Record")
+        path = self._record_path
+        if path and os.path.exists(path) and os.path.getsize(path) > 0:
+            self._sample_path = path
+            self._sample_label.setText(f"Recorded sample: {os.path.basename(path)}")
+            self._sample_label.setStyleSheet("color: #000;")
+            self._status.setText("Voice sample recorded.")
+        self._record_path = None
+
+    def _on_record_error(self, *_args) -> None:
+        self._btn_record.setText("Record")
+        self.error("Could not record audio. Check your microphone and try again.")
+
     def _validation_error(self) -> _t.Optional[str]:
         """Return a user-facing problem message, or None when input is valid."""
         if not self._text_edit.toPlainText().strip():
             return "The text is empty. Add some text or load a .txt file."
+        if not self.current_engine().has_voice_catalog and not self._sample_path:
+            return "Pick a voice sample first (6-30s of clear speech)."
         if self.selected_voice() is None:
             return "No voice is available for this selection."
         return None
@@ -321,7 +442,13 @@ class MainWindow(QMainWindow):
             return
 
         output = _new_tmp_path(".mp3")
-        self._status.setText("Synthesising\u2026")
+        if self.current_engine().has_voice_catalog:
+            self._status.setText("Synthesising\u2026")
+        else:
+            self._status.setText(
+                "Synthesising with your voice \u2026 (first run downloads "
+                "the model, ~1.8 GB)"
+            )
         self._set_busy(True)
         self._start_worker(self.current_engine(), text, voice, output,
                            self._on_synth_done, self._on_synth_failed)
@@ -336,14 +463,25 @@ class MainWindow(QMainWindow):
             self.error(problem)
             return
 
-        path, selected = QFileDialog.getSaveFileName(
-            self, "Export audio", "speech.mp3",
-            "MP3 audio (*.mp3);;WAV audio (*.wav)",
-        )
-        if not path:
-            return
-        if not os.path.splitext(path)[1]:
-            path += ".mp3" if "MP3" in selected else ".wav"
+        if self.current_engine().has_voice_catalog:
+            path, selected = QFileDialog.getSaveFileName(
+                self, "Export audio", "speech.mp3",
+                "MP3 audio (*.mp3);;WAV audio (*.wav)",
+            )
+            if not path:
+                return
+            if not os.path.splitext(path)[1]:
+                path += ".mp3" if "MP3" in selected else ".wav"
+        else:
+            # Cloning engines produce WAV only.
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Export audio", "speech.wav",
+                "WAV audio (*.wav)",
+            )
+            if not path:
+                return
+            if not os.path.splitext(path)[1]:
+                path += ".wav"
 
         self._status.setText("Exporting\u2026")
         self._set_busy(True)
@@ -433,6 +571,8 @@ class MainWindow(QMainWindow):
     def _set_busy(self, busy: bool) -> None:
         self._btn_play.setEnabled(not busy)
         self._btn_export.setEnabled(not busy)
+        self._btn_sample.setEnabled(not busy)
+        self._btn_record.setEnabled(not busy)
 
     def error(self, message: str) -> None:
         self._status.setText("Error")
