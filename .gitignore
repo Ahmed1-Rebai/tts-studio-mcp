@@ -35,6 +35,13 @@ Thumbs.db
 .idea/
 *.swp
 
-# Local audio / temp files
+# Local audio / subtitles / generated outputs / voice profiles
 *.mp3
 *.wav
+*.srt
+*.vtt
+*.timeline.json
+*.timings.json
+outputs/
+voice_profiles/
+training_runs/

@@ -1,0 +1,73 @@
+services:
+  # Default lightweight MCP + CLI service (edge-tts + pyttsx3 + ffmpeg)
+  tts-mcp:
+    build:
+      context: .
+      args:
+        INSTALL_XTTS: ${INSTALL_XTTS:-false}
+        INSTALL_ASR: ${INSTALL_ASR:-false}
+        TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
+    image: tts-mcp:latest
+    stdin_open: true
+    tty: false
+    environment:
+      TTS_APP_DATA_DIR: /data
+      TTS_APP_DEVICE: ${TTS_APP_DEVICE:-cpu}
+    volumes:
+      - ${TTS_WORKSPACE:-.}:/workspace
+      - tts_data:/data
+      - tts_model_cache:/root/.local/share/tts
+    command: ["tts-mcp"]
+
+  # CPU XTTS v2 profile: enables local voice cloning & profile enrollment
+  tts-mcp-xtts:
+    build:
+      context: .
+      args:
+        INSTALL_XTTS: "true"
+        INSTALL_ASR: ${INSTALL_ASR:-false}
+        TORCH_INDEX_URL: https://download.pytorch.org/whl/cpu
+    image: tts-mcp:xtts-cpu
+    profiles: ["xtts"]
+    stdin_open: true
+    tty: false
+    environment:
+      TTS_APP_DATA_DIR: /data
+      TTS_APP_DEVICE: cpu
+    volumes:
+      - ${TTS_WORKSPACE:-.}:/workspace
+      - tts_data:/data
+      - tts_model_cache:/root/.local/share/tts
+    command: ["tts-mcp"]
+
+  # NVIDIA CUDA GPU profile: fast XTTS cloning & custom voice fine-tuning
+  tts-mcp-gpu:
+    build:
+      context: .
+      args:
+        INSTALL_XTTS: "true"
+        INSTALL_ASR: ${INSTALL_ASR:-true}
+        TORCH_INDEX_URL: ${TORCH_CUDA_INDEX_URL:-https://download.pytorch.org/whl/cu124}
+    image: tts-mcp:xtts-gpu
+    profiles: ["gpu"]
+    stdin_open: true
+    tty: false
+    environment:
+      TTS_APP_DATA_DIR: /data
+      TTS_APP_DEVICE: cuda
+    volumes:
+      - ${TTS_WORKSPACE:-.}:/workspace
+      - tts_data:/data
+      - tts_model_cache:/root/.local/share/tts
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command: ["tts-mcp"]
+
+volumes:
+  tts_data:
+  tts_model_cache:

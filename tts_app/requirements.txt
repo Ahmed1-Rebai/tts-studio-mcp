@@ -1,8 +1,0 @@
-# TTS Desktop App
-# Text-to-Speech desktop application built with PyQt5.
-# Primary engine: edge-tts (online, huge multilingual voice catalog, gender labels).
-# Fallback engine: pyttsx3 (fully offline, uses system voices).
-
-PyQt5>=5.15.9
-edge-tts>=6.1.9
-pyttsx3>=2.90

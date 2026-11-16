@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "tts": {
+      "command": "/mnt/data/project/tts/venv/bin/python",
+      "args": ["-m", "tts_app.mcp_server"]
+    }
+  }
+}

@@ -1,18 +1,23 @@
-# Optional voice-cloning engine (Coqui XTTS v2).
-# Install only if you want the "your voice" feature:
+# Optional local voice-cloning and custom voice fine-tuning engine (Coqui XTTS v2).
+# Install only if you want local XTTS speakers, voice cloning, or custom voice training:
 #
 #   CPU (Linux/macOS/Windows):
 #     pip install torch torchaudio torchcodec --index-url https://download.pytorch.org/whl/cpu
 #     pip install -r requirements-xtts.txt
 #
-# For GPU, install torch/torchaudio/torchcodec from https://pytorch.org first,
-# then `pip install coqui-tts`.
+#   NVIDIA GPU (CUDA, required for practical custom voice training):
+#     Install CUDA-enabled torch/torchaudio/torchcodec from https://pytorch.org first,
+#     then: pip install -r requirements-xtts.txt
 #
-# The XTTS model (~1.8 GB) is downloaded automatically on first synthesis.
+# Optional auto-transcription for voice training datasets:
+#     pip install faster-whisper
+#
+# The XTTS v2 base model (~1.8 GB) is downloaded automatically on first use.
 
 torch
 torchaudio
 torchcodec
-coqui-tts
+coqui-tts>=0.27.5
+coqui-tts-trainer>=0.3.3
 # coqui-tts is not yet compatible with transformers 5.x
 transformers<5

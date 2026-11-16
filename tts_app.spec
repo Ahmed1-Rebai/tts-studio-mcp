@@ -6,12 +6,19 @@ run:  pyinstaller --noconfirm tts_app.spec
 to produce a single-file, windowed executable in ./dist.
 """
 
-from PyInstaller.utils.hooks import collect_submodules, collect_data_files
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 hiddenimports = [
-    "tts_app.gui",
+    "tts_app.models",
+    "tts_app.audio_utils",
+    "tts_app.subtitles",
+    "tts_app.voice_profiles",
     "tts_app.audio_player",
     "tts_app.tts_engine",
+    "tts_app.video_pipeline",
+    "tts_app.mcp_server",
+    "tts_app.cli",
+    "tts_app.gui",
 ]
 # edge-tts uses aiohttp/async with dynamically loaded submodules.
 hiddenimports += collect_submodules("edge_tts")
@@ -37,10 +44,8 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    # Keep the optional XTTS voice-cloning stack out of the binary — it is
-    # imported lazily at runtime and would add ~2 GB if bundled. Without these
-    # excludes PyInstaller would statically discover `import torch` inside
-    # tts_engine.py and drag the whole stack in.
+    # Keep the optional XTTS voice-cloning/training stack out of the binary — it
+    # is imported lazily at runtime and would add ~2 GB if bundled.
     excludes=[
         "tkinter",
         "torch",
@@ -48,7 +53,9 @@ a = Analysis(
         "torchcodec",
         "torchvision",
         "TTS",
+        "trainer",
         "transformers",
+        "faster_whisper",
         "librosa",
         "numba",
         "soundfile",
@@ -71,7 +78,7 @@ exe = EXE(
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=False,          # hide the console window on Windows
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
