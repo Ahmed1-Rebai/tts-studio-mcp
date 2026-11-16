@@ -1,4 +1,4 @@
-"""Main window for the Text-to-Speech desktop application."""
+"""Modern PyQt5 studio GUI for multi-engine TTS, video voiceovers, and voice profiles."""
 
 from __future__ import annotations
 
@@ -41,16 +41,24 @@ from PyQt5.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFormLayout,
-    QGroupBox,
+    QFrame,
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
+    QSizePolicy,
     QSlider,
+    QSpinBox,
+    QSplitter,
     QStackedWidget,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -58,16 +66,19 @@ from PyQt5.QtWidgets import (
 from tts_app.audio_player import PAUSED, PLAYING, AudioPlayer
 from tts_app.audio_utils import safe_remove
 from tts_app.models import SynthesisResult, TtsError, Voice
+from tts_app.theme import build_stylesheet
 from tts_app.tts_engine import (
     BaseTtsEngine,
     available_engines,
     language_display_name,
     language_subtag,
 )
+from tts_app.video_pipeline import generate_video_voiceover
 from tts_app.voice_profiles import (
     check_hardware_requirements,
     delete_profile,
     enroll_voice_profile,
+    get_outputs_dir,
     list_profiles,
 )
 
@@ -92,6 +103,7 @@ class _SynthesisWorker(QThread):
         speed: float,
         generate_subtitles: bool,
         normalize_loudness: bool,
+        trim_silence: bool,
     ) -> None:
         super().__init__()
         self._engine = engine
@@ -102,6 +114,7 @@ class _SynthesisWorker(QThread):
         self._speed = speed
         self._generate_subtitles = generate_subtitles
         self._normalize_loudness = normalize_loudness
+        self._trim_silence = trim_silence
 
     def run(self) -> None:
         try:
@@ -109,6 +122,7 @@ class _SynthesisWorker(QThread):
                 "speed": self._speed,
                 "generate_subtitles": self._generate_subtitles,
                 "normalize": self._normalize_loudness,
+                "trim": self._trim_silence,
             }
             if self._engine.id == "xtts_v2":
                 kwargs["language"] = self._language
@@ -129,17 +143,19 @@ class _EnrollWorker(QThread):
     succeeded = pyqtSignal(object)  # VoiceProfile
     failed = pyqtSignal(str)
 
-    def __init__(self, name: str, sample_path: str, language: str) -> None:
+    def __init__(
+        self, name: str, sample_paths: list[str], language: str
+    ) -> None:
         super().__init__()
         self._name = name
-        self._sample_path = sample_path
+        self._sample_paths = sample_paths
         self._language = language
 
     def run(self) -> None:
         try:
             prof = enroll_voice_profile(
                 name=self._name,
-                audio_paths=[self._sample_path],
+                audio_paths=self._sample_paths,
                 language=self._language,
                 preprocess=True,
             )
@@ -151,14 +167,46 @@ class _EnrollWorker(QThread):
             self.succeeded.emit(prof)
 
 
+class _VideoVoiceoverWorker(QThread):
+    """Run multi-scene video narration rendering on a background thread."""
+
+    succeeded = pyqtSignal(dict)
+    failed = pyqtSignal(str)
+
+    def __init__(self, kwargs: dict[str, _t.Any]) -> None:
+        super().__init__()
+        self._kwargs = kwargs
+
+    def run(self) -> None:
+        try:
+            res = generate_video_voiceover(**self._kwargs)
+        except TtsError as exc:
+            self.failed.emit(str(exc))
+        except Exception as exc:
+            self.failed.emit(f"Video voiceover failed: {exc}")
+        else:
+            self.succeeded.emit(res)
+
+
+def _make_card() -> tuple[QFrame, QVBoxLayout]:
+    card = QFrame()
+    card.setObjectName("Card")
+    layout = QVBoxLayout(card)
+    layout.setContentsMargins(16, 14, 16, 14)
+    layout.setSpacing(10)
+    return card, layout
+
+
 class MainWindow(QMainWindow):
-    """The application's main window."""
+    """Modern desktop studio window for Text-to-Speech and Video Narration."""
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Text-to-Speech")
-        self.resize(820, 820)
+        self.setWindowTitle("Voice Studio — TTS, Video Narration & Cloning")
+        self.resize(1040, 760)
+        self.setMinimumSize(860, 640)
 
+        self._dark_mode = True
         self._engines = available_engines()
         self._player = AudioPlayer()
         self._worker: _t.Optional[QThread] = None
@@ -166,6 +214,7 @@ class MainWindow(QMainWindow):
         #: key (engine_id, text, voice_id, language, speed) for cached playback.
         self._loaded_key: _t.Optional[tuple[str, str, str, str, float]] = None
         self._playable_path: _t.Optional[str] = None
+        self._video_master_path: _t.Optional[str] = None
         self._temp_files: list[str] = []
         self._scrubbing = False
 
@@ -174,108 +223,248 @@ class MainWindow(QMainWindow):
         self._recorder: _t.Optional[QAudioRecorder] = None
         self._record_path: _t.Optional[str] = None
 
+        self._hw_snapshot = check_hardware_requirements()
+
         self._build_ui()
         self._wire_signals()
+        self._apply_theme()
         self._seed_engine()
+        self._refresh_profiles_tab()
 
     # ----------------------------------------------------------------- #
     # UI construction
     # ----------------------------------------------------------------- #
     def _build_ui(self) -> None:
-        central = QWidget()
-        layout = QVBoxLayout(central)
-        self.setCentralWidget(central)
+        root = QWidget()
+        root.setObjectName("AppRoot")
+        main_layout = QVBoxLayout(root)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+        self.setCentralWidget(root)
 
-        # -- Text source ---------------------------------------------------
-        source_box = QGroupBox("Text source")
-        source = QVBoxLayout(source_box)
+        content_wrap = QWidget()
+        content = QVBoxLayout(content_wrap)
+        content.setContentsMargins(18, 14, 18, 12)
+        content.setSpacing(12)
 
-        file_row = QHBoxLayout()
-        self._btn_load = QPushButton("Load .txt file\u2026")
-        self._file_label = QLabel("No file selected")
-        self._file_label.setStyleSheet("color: #777;")
-        file_row.addWidget(self._btn_load)
-        file_row.addWidget(self._file_label, 1)
-        source.addLayout(file_row)
+        # -- Header Bar ----------------------------------------------------
+        header = QHBoxLayout()
+        title_col = QVBoxLayout()
+        title_col.setSpacing(2)
+        title = QLabel("Voice Studio")
+        title.setObjectName("TitleLabel")
+        subtitle = QLabel(
+            "Smart Multi-Engine TTS · Video Narration & Subtitles · Voice Cloning"
+        )
+        subtitle.setObjectName("SubtitleLabel")
+        title_col.addWidget(title)
+        title_col.addWidget(subtitle)
+        header.addLayout(title_col, 1)
+
+        gpu_text = (
+            f"GPU: {self._hw_snapshot['gpu_name']}"
+            if self._hw_snapshot["cuda_available"]
+            else f"CPU ({self._hw_snapshot['cpu_cores']} cores)"
+        )
+        gpu_pill = QLabel(gpu_text)
+        gpu_pill.setObjectName("StatusBadge")
+        ffmpeg_pill = QLabel(
+            "FFmpeg Ready" if self._hw_snapshot["ffmpeg_installed"] else "FFmpeg Missing"
+        )
+        ffmpeg_pill.setObjectName("StatusBadge")
+        self._btn_hw_info = QPushButton("Hardware / Training")
+        self._btn_theme = QPushButton("Light Mode")
+
+        header.addWidget(gpu_pill)
+        header.addWidget(ffmpeg_pill)
+        header.addWidget(self._btn_hw_info)
+        header.addWidget(self._btn_theme)
+        content.addLayout(header)
+
+        # -- Tab Workspace -------------------------------------------------
+        self._tabs = QTabWidget()
+        tab_font = self._tabs.tabBar().font()
+        tab_font.setWeight(QFont.DemiBold)
+        self._tabs.tabBar().setFont(tab_font)
+        self._tabs.tabBar().setExpanding(False)
+        self._tabs.tabBar().setUsesScrollButtons(False)
+        self._tabs.addTab(self._build_studio_tab(), "Speech Studio")
+        self._tabs.addTab(self._build_video_tab(), "Video Voiceover")
+        self._tabs.addTab(self._build_profiles_tab(), "Voice Profiles")
+        content.addWidget(self._tabs, 1)
+
+        main_layout.addWidget(content_wrap, 1)
+
+        # -- Docked Transport Bar ------------------------------------------
+        transport = QFrame()
+        transport.setObjectName("TransportBar")
+        t_outer = QVBoxLayout(transport)
+        t_outer.setContentsMargins(18, 8, 18, 12)
+        t_outer.setSpacing(8)
+
+        self._busy_bar = QProgressBar()
+        self._busy_bar.setRange(0, 1)
+        self._busy_bar.setValue(0)
+        self._busy_bar.setTextVisible(False)
+        self._busy_bar.setFixedHeight(4)
+        t_outer.addWidget(self._busy_bar)
+
+        seek_row = QHBoxLayout()
+        self._progress = QSlider(Qt.Horizontal)
+        self._progress.setEnabled(False)
+        self._time_label = QLabel("00:00 / 00:00")
+        self._time_label.setObjectName("MutedLabel")
+        self._time_label.setMinimumWidth(95)
+        self._time_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        seek_row.addWidget(self._progress, 1)
+        seek_row.addWidget(self._time_label)
+        t_outer.addLayout(seek_row)
+
+        btn_row = QHBoxLayout()
+        self._btn_play = QPushButton("Play")
+        self._btn_play.setObjectName("PrimaryButton")
+        self._btn_pause = QPushButton("Pause")
+        self._btn_stop = QPushButton("Stop")
+        self._btn_export = QPushButton("Export Audio\u2026")
+        for b in (self._btn_play, self._btn_pause, self._btn_stop, self._btn_export):
+            btn_row.addWidget(b)
+        btn_row.addSpacing(12)
+        self._status = QLabel("Ready.")
+        self._status.setObjectName("MutedLabel")
+        btn_row.addWidget(self._status, 1)
+        t_outer.addLayout(btn_row)
+
+        main_layout.addWidget(transport)
+
+    def _build_studio_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QHBoxLayout(page)
+        layout.setContentsMargins(0, 6, 0, 0)
+        layout.setSpacing(12)
+
+        splitter = QSplitter(Qt.Horizontal)
+
+        # Left Card: Script editor
+        script_card, script_l = _make_card()
+        script_head = QHBoxLayout()
+        lbl_script = QLabel("Script / Text")
+        lbl_script.setObjectName("SectionTitle")
+        self._word_stats = QLabel("0 words · ~0s")
+        self._word_stats.setObjectName("MutedLabel")
+        script_head.addWidget(lbl_script)
+        script_head.addStretch(1)
+        script_head.addWidget(self._word_stats)
+        script_l.addLayout(script_head)
+
+        tool_row = QHBoxLayout()
+        self._btn_load = QPushButton("Load .txt\u2026")
+        self._btn_insert_scene = QPushButton("+ Scene Tag")
+        self._btn_clear_text = QPushButton("Clear")
+        self._file_label = QLabel("No file loaded")
+        self._file_label.setObjectName("MutedLabel")
+        tool_row.addWidget(self._btn_load)
+        tool_row.addWidget(self._btn_insert_scene)
+        tool_row.addWidget(self._btn_clear_text)
+        tool_row.addWidget(self._file_label, 1)
+        script_l.addLayout(tool_row)
 
         self._text_edit = QPlainTextEdit()
         self._text_edit.setPlaceholderText(
-            "Paste or type the text you want to hear\u2026"
+            "Type or paste narration text here\u2026\n\n"
+            "Tip: Use [scene: intro] markers in the Video Voiceover tab to build timed scenes."
         )
         self._text_edit.setFont(QFont("Sans Serif", 11))
-        self._text_edit.setMinimumHeight(160)
-        source.addWidget(self._text_edit)
-        layout.addWidget(source_box)
+        script_l.addWidget(self._text_edit, 1)
 
-        # -- Voice selection -------------------------------------------------
-        voice_box = QGroupBox("Voice & Prosody")
-        form = QFormLayout(voice_box)
-        form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        # Right Card: Voice & Prosody settings
+        ctrl_card, ctrl_l = _make_card()
+        lbl_ctrl = QLabel("Voice & Synthesis Controls")
+        lbl_ctrl.setObjectName("SectionTitle")
+        ctrl_l.addWidget(lbl_ctrl)
+
+        form = QFormLayout()
+        form.setSpacing(10)
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
 
         self._engine_combo = QComboBox()
+        self._engine_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         for engine in self._engines:
             self._engine_combo.addItem(engine.label)
         form.addRow("Engine:", self._engine_combo)
 
         self._language_combo = QComboBox()
+        self._language_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         form.addRow("Language:", self._language_combo)
+        ctrl_l.addLayout(form)
 
-        # -- Voice catalog vs. XTTS cloning/profiles -----------------------
+        # Voice stack (Catalog vs XTTS cloning/profiles)
         self._voice_stack = QStackedWidget()
 
         catalog_page = QWidget()
         cv = QVBoxLayout(catalog_page)
         cv.setContentsMargins(0, 0, 0, 0)
+        cv.setSpacing(8)
+
+        self._voice_search = QLineEdit()
+        self._voice_search.setPlaceholderText("Search voices by name or locale (e.g. Andrew, UK)\u2026")
+        self._voice_search.setClearButtonEnabled(True)
+        cv.addWidget(self._voice_search)
+
         self._voice_combo = QComboBox()
         cv.addWidget(self._voice_combo)
+
         filters = QHBoxLayout()
         filters.addWidget(QLabel("Gender:"))
         self._gender_combo = QComboBox()
-        filters.addWidget(self._gender_combo)
-        filters.addSpacing(16)
+        filters.addWidget(self._gender_combo, 1)
+        filters.addSpacing(8)
         filters.addWidget(QLabel("Age:"))
         self._age_combo = QComboBox()
-        filters.addWidget(self._age_combo)
-        filters.addStretch(1)
+        filters.addWidget(self._age_combo, 1)
         cv.addLayout(filters)
         self._voice_stack.addWidget(catalog_page)
 
         xtts_page = QWidget()
         sv = QVBoxLayout(xtts_page)
         sv.setContentsMargins(0, 0, 0, 0)
+        sv.setSpacing(8)
 
         self._xtts_target_combo = QComboBox()
         sv.addWidget(self._xtts_target_combo)
 
-        sample = QHBoxLayout()
-        self._btn_sample = QPushButton("Choose voice sample\u2026")
-        self._btn_record = QPushButton("Record")
+        sample_btns = QHBoxLayout()
+        self._btn_sample = QPushButton("Choose Sample\u2026")
+        self._btn_record = QPushButton("Record Mic")
+        sample_btns.addWidget(self._btn_sample, 1)
+        sample_btns.addWidget(self._btn_record, 1)
+        sv.addLayout(sample_btns)
+
+        prof_btns = QHBoxLayout()
         self._btn_save_profile = QPushButton("Save as Profile\u2026")
         self._btn_delete_profile = QPushButton("Delete Profile")
-        self._btn_hw_info = QPushButton("Training & Hardware Info")
-        self._sample_label = QLabel("No sample selected")
-        self._sample_label.setStyleSheet("color: #777;")
-        sample.addWidget(self._btn_sample)
-        sample.addWidget(self._btn_record)
-        sample.addWidget(self._btn_save_profile)
-        sample.addWidget(self._btn_delete_profile)
-        sample.addWidget(self._btn_hw_info)
-        sample.addWidget(self._sample_label, 1)
-        sv.addLayout(sample)
+        self._btn_delete_profile.setObjectName("DangerButton")
+        prof_btns.addWidget(self._btn_save_profile, 1)
+        prof_btns.addWidget(self._btn_delete_profile, 1)
+        sv.addLayout(prof_btns)
+
+        self._sample_label = QLabel("No custom sample selected")
+        self._sample_label.setObjectName("MutedLabel")
+        self._sample_label.setWordWrap(True)
+        sv.addWidget(self._sample_label)
 
         self._sample_hint = QLabel(
-            "Choose a saved voice profile, a built-in XTTS speaker, or record/pick "
-            "6-30s of clear speech. Click 'Save as Profile' to reuse your voice fast."
+            "Select a saved voice profile, a built-in XTTS speaker, or 6-30s of clean speech."
         )
+        self._sample_hint.setObjectName("MutedLabel")
         self._sample_hint.setWordWrap(True)
-        self._sample_hint.setStyleSheet("color: #777;")
         sv.addWidget(self._sample_hint)
         self._voice_stack.addWidget(xtts_page)
 
-        form.addRow("Voice:", self._voice_stack)
+        ctrl_l.addWidget(self._voice_stack)
 
-        # -- Speed control -------------------------------------------------
+        # Speed slider
         speed_row = QHBoxLayout()
+        speed_lbl = QLabel("Speed:")
         self._speed_slider = QSlider(Qt.Horizontal)
         self._speed_slider.setMinimum(75)
         self._speed_slider.setMaximum(150)
@@ -283,68 +472,255 @@ class MainWindow(QMainWindow):
         self._speed_slider.setSingleStep(5)
         self._speed_label = QLabel("1.00x")
         self._speed_label.setMinimumWidth(45)
+        self._btn_reset_speed = QPushButton("Reset")
+        speed_row.addWidget(speed_lbl)
         speed_row.addWidget(self._speed_slider, 1)
         speed_row.addWidget(self._speed_label)
-        form.addRow("Speed:", speed_row)
+        speed_row.addWidget(self._btn_reset_speed)
+        ctrl_l.addLayout(speed_row)
 
-        layout.addWidget(voice_box)
-
-        # -- Playback & Export ---------------------------------------------
-        play_box = QGroupBox("Playback & Video Export")
-        play = QVBoxLayout(play_box)
-
-        self._progress = QSlider(Qt.Horizontal)
-        self._progress.setEnabled(False)
-        self._time_label = QLabel("00:00 / 00:00")
-        self._time_label.setAlignment(Qt.AlignCenter)
-        play.addWidget(self._progress)
-        play.addWidget(self._time_label)
-
-        opts = QHBoxLayout()
-        self._chk_subtitles = QCheckBox("Also export video subtitles (.srt, .vtt, .timings.json)")
+        # Post-processing & video options
         self._chk_normalize = QCheckBox("Normalize loudness (-16 LUFS)")
-        opts.addWidget(self._chk_subtitles)
-        opts.addWidget(self._chk_normalize)
-        opts.addStretch(1)
-        play.addLayout(opts)
+        self._chk_trim = QCheckBox("Trim leading and trailing silence")
+        self._chk_subtitles = QCheckBox("Export captions (.srt, .vtt, .timings.json)")
+        ctrl_l.addWidget(self._chk_normalize)
+        ctrl_l.addWidget(self._chk_trim)
+        ctrl_l.addWidget(self._chk_subtitles)
+        ctrl_l.addStretch(1)
 
-        buttons = QHBoxLayout()
-        self._btn_play = QPushButton("Play")
-        self._btn_pause = QPushButton("Pause")
-        self._btn_stop = QPushButton("Stop")
-        self._btn_export = QPushButton("Export\u2026")
-        for button in (
-            self._btn_play,
-            self._btn_pause,
-            self._btn_stop,
-            self._btn_export,
+        splitter.addWidget(script_card)
+        splitter.addWidget(ctrl_card)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        layout.addWidget(splitter)
+        return page
+
+    def _build_video_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QHBoxLayout(page)
+        layout.setContentsMargins(0, 6, 0, 0)
+        layout.setSpacing(12)
+
+        # Left: Multi-scene script editor
+        left_card, left_l = _make_card()
+        head = QHBoxLayout()
+        lbl = QLabel("Multi-Scene Storyboard Script")
+        lbl.setObjectName("SectionTitle")
+        self._btn_copy_from_studio = QPushButton("Copy from Speech Studio")
+        head.addWidget(lbl)
+        head.addStretch(1)
+        head.addWidget(self._btn_copy_from_studio)
+        left_l.addLayout(head)
+
+        self._video_script_edit = QPlainTextEdit()
+        self._video_script_edit.setPlaceholderText(
+            "[scene: hook]\nStop editing video captions by hand.\n\n"
+            "[scene: demo]\nGenerate synced voiceover, SRT, and frame timings in one click."
+        )
+        self._video_script_edit.setFont(QFont("Sans Serif", 11))
+        left_l.addWidget(self._video_script_edit, 1)
+
+        # Right: Render settings & outputs
+        right_card, right_l = _make_card()
+        rlbl = QLabel("Render Settings & Output")
+        rlbl.setObjectName("SectionTitle")
+        right_l.addWidget(rlbl)
+
+        form = QFormLayout()
+        form.setSpacing(10)
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+
+        self._video_name_edit = QLineEdit("voiceover")
+        form.addRow("Output Name:", self._video_name_edit)
+
+        out_row = QHBoxLayout()
+        self._video_dir_edit = QLineEdit(os.path.join(get_outputs_dir(), "studio_video"))
+        self._btn_video_dir = QPushButton("Browse\u2026")
+        out_row.addWidget(self._video_dir_edit, 1)
+        out_row.addWidget(self._btn_video_dir)
+        form.addRow("Output Folder:", out_row)
+
+        self._video_fps_combo = QComboBox()
+        self._video_fps_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        for fps_val in (24, 25, 30, 60):
+            self._video_fps_combo.addItem(f"{fps_val} fps", userData=fps_val)
+        self._video_fps_combo.setCurrentIndex(2)  # 30 fps
+        form.addRow("Frame Rate:", self._video_fps_combo)
+
+        self._video_pause_spin = QSpinBox()
+        self._video_pause_spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._video_pause_spin.setRange(0, 5000)
+        self._video_pause_spin.setSingleStep(50)
+        self._video_pause_spin.setValue(350)
+        self._video_pause_spin.setSuffix(" ms")
+        form.addRow("Scene Pause:", self._video_pause_spin)
+
+        self._video_fmt_combo = QComboBox()
+        self._video_fmt_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._video_fmt_combo.addItems(["mp3", "wav"])
+        form.addRow("Format:", self._video_fmt_combo)
+
+        mp4_row = QHBoxLayout()
+        self._video_mp4_edit = QLineEdit()
+        self._video_mp4_edit.setPlaceholderText("Optional MP4/MOV to mux onto\u2026")
+        self._btn_pick_mp4 = QPushButton("Pick Video\u2026")
+        mp4_row.addWidget(self._video_mp4_edit, 1)
+        mp4_row.addWidget(self._btn_pick_mp4)
+        form.addRow("Target Video:", mp4_row)
+        right_l.addLayout(form)
+
+        self._chk_burn_subs = QCheckBox("Burn subtitles onto video (re-encodes video)")
+        right_l.addWidget(self._chk_burn_subs)
+
+        action_row = QHBoxLayout()
+        self._btn_render_video = QPushButton("Render Voiceover + Timeline")
+        self._btn_render_video.setObjectName("PrimaryButton")
+        self._btn_play_video_master = QPushButton("Play Master")
+        self._btn_play_video_master.setEnabled(False)
+        action_row.addWidget(self._btn_render_video, 1)
+        action_row.addWidget(self._btn_play_video_master)
+        right_l.addLayout(action_row)
+
+        self._video_result_view = QPlainTextEdit()
+        self._video_result_view.setReadOnly(True)
+        self._video_result_view.setPlaceholderText(
+            "Render summary, generated .srt/.vtt/.timings.json paths, and scene frame offsets appear here."
+        )
+        right_l.addWidget(self._video_result_view, 1)
+
+        layout.addWidget(left_card, 3)
+        layout.addWidget(right_card, 2)
+        return page
+
+    def _build_profiles_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QHBoxLayout(page)
+        layout.setContentsMargins(0, 6, 0, 0)
+        layout.setSpacing(12)
+
+        # Left: Saved Voice Profiles
+        left_card, left_l = _make_card()
+        lbl = QLabel("Saved Custom Voice Profiles")
+        lbl.setObjectName("SectionTitle")
+        left_l.addWidget(lbl)
+
+        self._profiles_list = QListWidget()
+        left_l.addWidget(self._profiles_list, 1)
+
+        btn_row = QHBoxLayout()
+        self._btn_use_profile = QPushButton("Use in Studio")
+        self._btn_use_profile.setObjectName("PrimaryButton")
+        self._btn_enroll_files = QPushButton("Enroll Audio Clips\u2026")
+        self._btn_refresh_profiles = QPushButton("Refresh")
+        self._btn_remove_profile_tab = QPushButton("Delete")
+        self._btn_remove_profile_tab.setObjectName("DangerButton")
+        for b in (
+            self._btn_use_profile,
+            self._btn_enroll_files,
+            self._btn_refresh_profiles,
+            self._btn_remove_profile_tab,
         ):
-            buttons.addWidget(button)
-        buttons.addStretch(1)
-        play.addLayout(buttons)
-        layout.addWidget(play_box)
+            btn_row.addWidget(b)
+        left_l.addLayout(btn_row)
 
-        self._status = QLabel("Ready.")
-        layout.addWidget(self._status)
+        # Right: Hardware Tiers & Training Guide
+        right_card, right_l = _make_card()
+        hlbl = QLabel("Hardware Readiness & Custom Voice Training")
+        hlbl.setObjectName("SectionTitle")
+        right_l.addWidget(hlbl)
+
+        self._hw_summary_view = QPlainTextEdit()
+        self._hw_summary_view.setReadOnly(True)
+        right_l.addWidget(self._hw_summary_view, 1)
+        self._populate_hardware_summary()
+
+        layout.addWidget(left_card, 3)
+        layout.addWidget(right_card, 2)
+        return page
+
+    def _populate_hardware_summary(self) -> None:
+        hw = self._hw_snapshot
+        gpu_desc = (
+            f"{hw['gpu_name']} ({hw['vram_gb']} GB VRAM)"
+            if hw["cuda_available"]
+            else "None detected by PyTorch (CPU mode)"
+        )
+        lines = [
+            f"CPU Cores: {hw['cpu_cores']}  |  RAM: {hw['ram_total_gb']} GB  |  Free Disk: {hw['disk_free_gb']} GB",
+            f"CUDA GPU: {gpu_desc}",
+            f"FFmpeg: {'Installed' if hw['ffmpeg_installed'] else 'Missing'}  |  eSpeak: {'Installed' if hw['espeak_installed'] else 'Missing'}",
+            "",
+        ]
+        for tier_key, title in (
+            ("standard_tts", "1. Standard TTS & Video Narration"),
+            ("xtts_inference", "2. Local XTTS Cloning & Enrolled Profiles"),
+            ("xtts_finetuning", "3. Full Custom Voice Training (Fine-Tuning)"),
+        ):
+            tier = hw["tiers"][tier_key]
+            badge = "READY" if tier["ready"] else "NOT READY"
+            lines.append(f"[{badge}] {title}")
+            lines.append(f"  Min HW: {tier['minimum']}")
+            for note in tier["notes"]:
+                lines.append(f"  Note: {note}")
+            lines.append("")
+        lines.append(
+            "Enroll fast reusable profiles via 'Enroll Audio Clips...' or fine-tune XTTS v2 "
+            "using `tts-cli train-voice` / MCP tool `train_custom_voice`."
+        )
+        self._hw_summary_view.setPlainText("\n".join(lines))
+
+    def _apply_theme(self) -> None:
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(build_stylesheet(dark=self._dark_mode))
+        self._btn_theme.setText("Light Mode" if self._dark_mode else "Dark Mode")
+
+    def on_toggle_theme(self) -> None:
+        self._dark_mode = not self._dark_mode
+        self._apply_theme()
 
     def _wire_signals(self) -> None:
+        # Header & Studio text
+        self._btn_theme.clicked.connect(self.on_toggle_theme)
+        self._btn_hw_info.clicked.connect(self.on_show_training_info)
         self._btn_load.clicked.connect(self.on_load_file)
+        self._btn_insert_scene.clicked.connect(self._on_insert_scene_tag)
+        self._btn_clear_text.clicked.connect(self._text_edit.clear)
+        self._text_edit.textChanged.connect(self._update_word_stats)
+
+        # Voice controls
         self._btn_sample.clicked.connect(self.on_choose_sample)
         self._btn_record.clicked.connect(self.on_record)
         self._btn_save_profile.clicked.connect(self.on_save_profile)
         self._btn_delete_profile.clicked.connect(self.on_delete_profile)
-        self._btn_hw_info.clicked.connect(self.on_show_training_info)
-        self._btn_play.clicked.connect(self.on_play)
-        self._btn_pause.clicked.connect(self._player.pause)
-        self._btn_stop.clicked.connect(self.on_stop)
-        self._btn_export.clicked.connect(self.on_export)
+        self._btn_reset_speed.clicked.connect(lambda: self._speed_slider.setValue(100))
 
         self._engine_combo.currentIndexChanged.connect(self._seed_engine)
         self._language_combo.currentIndexChanged.connect(self._on_language_changed)
         self._gender_combo.currentIndexChanged.connect(self._update_voices)
         self._age_combo.currentIndexChanged.connect(self._update_voices)
+        self._voice_search.textChanged.connect(self._update_voices)
         self._xtts_target_combo.currentIndexChanged.connect(self._on_xtts_target_changed)
         self._speed_slider.valueChanged.connect(self._on_speed_changed)
+
+        # Video tab
+        self._btn_copy_from_studio.clicked.connect(self._on_copy_to_video_tab)
+        self._btn_video_dir.clicked.connect(self._on_pick_video_output_dir)
+        self._btn_pick_mp4.clicked.connect(self._on_pick_target_mp4)
+        self._btn_render_video.clicked.connect(self.on_render_video_voiceover)
+        self._btn_play_video_master.clicked.connect(self._on_play_video_master)
+
+        # Profiles tab
+        self._btn_use_profile.clicked.connect(self._on_use_selected_profile)
+        self._btn_enroll_files.clicked.connect(self._on_enroll_multiple_files)
+        self._btn_refresh_profiles.clicked.connect(self._refresh_profiles_tab)
+        self._btn_remove_profile_tab.clicked.connect(self._on_delete_selected_profile_tab)
+
+        # Transport & player
+        self._btn_play.clicked.connect(self.on_play)
+        self._btn_pause.clicked.connect(self._player.pause)
+        self._btn_stop.clicked.connect(self.on_stop)
+        self._btn_export.clicked.connect(self.on_export)
 
         self._player.positionChanged.connect(self._on_position)
         self._player.durationChanged.connect(self._on_duration)
@@ -356,8 +732,24 @@ class MainWindow(QMainWindow):
         self._progress.sliderReleased.connect(self._stop_scrub)
 
     # ----------------------------------------------------------------- #
-    # Dynamic dropdown population
+    # Dynamic dropdown population & script helpers
     # ----------------------------------------------------------------- #
+    def _update_word_stats(self) -> None:
+        text = self._text_edit.toPlainText().strip()
+        words = len(text.split()) if text else 0
+        est_s = round(words / 2.5 / max(0.5, self._current_speed())) if words else 0
+        self._word_stats.setText(f"{words} words · {len(text)} chars · ~{est_s}s")
+
+    def _on_insert_scene_tag(self) -> None:
+        name, ok = QInputDialog.getText(
+            self, "Insert Scene Marker", "Scene id (e.g. intro, demo, outro):"
+        )
+        if not ok or not name.strip():
+            return
+        cursor = self._text_edit.textCursor()
+        prefix = "" if not self._text_edit.toPlainText().strip() else "\n\n"
+        cursor.insertText(f"{prefix}[scene: {name.strip()}]\n")
+
     def current_engine(self) -> BaseTtsEngine:
         return self._engines[self._engine_combo.currentIndex()]
 
@@ -366,6 +758,7 @@ class MainWindow(QMainWindow):
 
     def _on_speed_changed(self, value: int) -> None:
         self._speed_label.setText(f"{value / 100.0:.2f}x")
+        self._update_word_stats()
 
     def _seed_engine(self) -> None:
         engine = self.current_engine()
@@ -427,6 +820,17 @@ class MainWindow(QMainWindow):
         self._xtts_target_combo.blockSignals(False)
         self._on_xtts_target_changed()
 
+    def _refresh_profiles_tab(self) -> None:
+        self._profiles_list.clear()
+        for prof in list_profiles():
+            label = (
+                f"{prof.name}  [{prof.kind}]  ·  lang={prof.language}  ·  "
+                f"{prof.sample_count} clip(s) ({prof.total_source_duration_s}s)"
+            )
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, prof)
+            self._profiles_list.addItem(item)
+
     def _on_xtts_target_changed(self) -> None:
         data = self._xtts_target_combo.currentData()
         using_sample = data == _SAMPLE_VOICE_OPTION
@@ -464,12 +868,21 @@ class MainWindow(QMainWindow):
         language = self._selected_language()
         gender = self._gender_combo.currentText()
         age = self._age_combo.currentText()
+        query = self._voice_search.text().strip().lower()
 
         voices = engine.list_voices(language)
         if gender != _ANY:
             voices = [v for v in voices if v.gender == gender]
         if age != _ANY:
             voices = [v for v in voices if v.age == age]
+        if query:
+            voices = [
+                v
+                for v in voices
+                if query in v.name.lower()
+                or query in v.id.lower()
+                or query in v.locale.lower()
+            ]
         voices.sort(key=lambda v: (v.gender != "Female", v.name))
 
         self._voice_combo.blockSignals(True)
@@ -522,7 +935,7 @@ class MainWindow(QMainWindow):
         return self._voice_combo.currentData() if self._voice_combo.count() else None
 
     # ----------------------------------------------------------------- #
-    # User actions
+    # User actions: files, recording, profiles
     # ----------------------------------------------------------------- #
     def on_load_file(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -537,7 +950,7 @@ class MainWindow(QMainWindow):
             self.error(f"Could not read the file:\n{exc}")
             return
         self._text_edit.setPlainText(content)
-        self._file_label.setText(path)
+        self._file_label.setText(os.path.basename(path))
         self._status.setText(f"Loaded {os.path.basename(path)}")
 
     def on_choose_sample(self) -> None:
@@ -550,8 +963,7 @@ class MainWindow(QMainWindow):
         if not path:
             return
         self._sample_path = path
-        self._sample_label.setText(os.path.basename(path))
-        self._sample_label.setStyleSheet("color: #000;")
+        self._sample_label.setText(f"Sample: {os.path.basename(path)}")
         self._btn_save_profile.setEnabled(True)
         self._status.setText(f"Voice sample: {os.path.basename(path)}")
 
@@ -575,30 +987,43 @@ class MainWindow(QMainWindow):
         self._recorder = rec
         self._record_path = path
         rec.record()
-        self._btn_record.setText("Stop recording")
-        self._status.setText("Recording\u2026 click Stop when done")
+        self._btn_record.setText("Stop Recording")
+        self._status.setText("Recording microphone\u2026 click Stop when done.")
 
     def _on_record_state(self, state: int) -> None:
         if state != QMediaRecorder.StoppedState:
             return
-        self._btn_record.setText("Record")
+        self._btn_record.setText("Record Mic")
         path = self._record_path
         if path and os.path.exists(path) and os.path.getsize(path) > 0:
             self._sample_path = path
             self._sample_label.setText(f"Recorded: {os.path.basename(path)}")
-            self._sample_label.setStyleSheet("color: #000;")
             self._btn_save_profile.setEnabled(True)
             self._status.setText("Voice sample recorded.")
         self._record_path = None
 
     def _on_record_error(self, *_args) -> None:
-        self._btn_record.setText("Record")
+        self._btn_record.setText("Record Mic")
         self.error("Could not record audio. Check your microphone and try again.")
 
     def on_save_profile(self) -> None:
         if not self._sample_path or not os.path.isfile(self._sample_path):
             self.error("Record or choose a voice sample first.")
             return
+        self._enroll_paths_interactive([self._sample_path])
+
+    def _on_enroll_multiple_files(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select 1 or more clean voice clips",
+            "",
+            "Audio files (*.wav *.mp3 *.flac *.ogg *.m4a);;All files (*)",
+        )
+        if not paths:
+            return
+        self._enroll_paths_interactive(paths)
+
+    def _enroll_paths_interactive(self, paths: list[str]) -> None:
         name, ok = QInputDialog.getText(
             self, "Save Voice Profile", "Profile name (e.g. 'My Voice'):"
         )
@@ -608,7 +1033,7 @@ class MainWindow(QMainWindow):
         self._status.setText("Enrolling voice profile (extracting speaker latents)\u2026")
         self._set_busy(True)
         worker = _EnrollWorker(
-            name.strip(), self._sample_path, language_subtag(self._selected_language())
+            name.strip(), paths, language_subtag(self._selected_language())
         )
         worker.succeeded.connect(self._on_enroll_done)
         worker.failed.connect(self._on_synth_failed)
@@ -619,6 +1044,7 @@ class MainWindow(QMainWindow):
     def _on_enroll_done(self, profile) -> None:
         self._set_busy(False)
         self._refresh_xtts_targets(select_id=f"profile:{profile.id}")
+        self._refresh_profiles_tab()
         self._status.setText(f"Saved voice profile: {profile.name}")
         QMessageBox.information(
             self,
@@ -631,49 +1057,139 @@ class MainWindow(QMainWindow):
         data = self._xtts_target_combo.currentData()
         if not isinstance(data, Voice) or not data.id.startswith("profile:"):
             return
-        pid = data.id[len("profile:") :]
+        self._delete_profile_by_id(data.id[len("profile:") :], data.name)
+
+    def _on_delete_selected_profile_tab(self) -> None:
+        item = self._profiles_list.currentItem()
+        if item is None:
+            return
+        prof = item.data(Qt.UserRole)
+        self._delete_profile_by_id(prof.id, prof.name)
+
+    def _delete_profile_by_id(self, profile_id: str, display_name: str) -> None:
         reply = QMessageBox.question(
             self,
             "Delete Voice Profile",
-            f"Delete saved voice profile '{data.name}'?",
+            f"Delete saved voice profile '{display_name}'?",
         )
         if reply != QMessageBox.Yes:
             return
         try:
-            delete_profile(pid)
+            delete_profile(profile_id)
         except TtsError as exc:
             self.error(str(exc))
             return
-        self._refresh_xtts_targets()
-        self._status.setText(f"Deleted profile: {data.name}")
+        if not self.current_engine().has_voice_catalog:
+            self._refresh_xtts_targets()
+        self._refresh_profiles_tab()
+        self._status.setText(f"Deleted profile: {display_name}")
+
+    def _on_use_selected_profile(self) -> None:
+        item = self._profiles_list.currentItem()
+        if item is None:
+            self.error("Select a voice profile first.")
+            return
+        prof = item.data(Qt.UserRole)
+        for idx, eng in enumerate(self._engines):
+            if eng.id == "xtts_v2":
+                self._engine_combo.setCurrentIndex(idx)
+                self._refresh_xtts_targets(select_id=f"profile:{prof.id}")
+                self._tabs.setCurrentIndex(0)
+                self._status.setText(f"Selected voice profile: {prof.name}")
+                return
+        self.error("XTTS v2 engine is not installed.")
 
     def on_show_training_info(self) -> None:
-        hw = check_hardware_requirements()
-        t_inf = hw["tiers"]["xtts_inference"]
-        t_ft = hw["tiers"]["xtts_finetuning"]
-        gpu_line = (
-            f"{hw['gpu_name']} ({hw['vram_gb']} GB VRAM)"
-            if hw["cuda_available"]
-            else "None detected by PyTorch (CPU mode)"
-        )
-        msg = (
-            f"Detected Hardware:\n"
-            f"  CPU Cores: {hw['cpu_cores']} | RAM: {hw['ram_total_gb']} GB | Disk free: {hw['disk_free_gb']} GB\n"
-            f"  CUDA GPU: {gpu_line}\n"
-            f"  FFmpeg: {'Yes' if hw['ffmpeg_installed'] else 'No'}\n\n"
-            f"1. Voice Profile Enrollment (Fast Cloning):\n"
-            f"   Ready: {'Yes' if t_inf['ready'] else 'No'}\n"
-            f"   Min HW: {t_inf['minimum']}\n"
-            f"   Use 'Save as Profile' in the GUI or `tts-cli enroll-voice`.\n\n"
-            f"2. Full Custom Voice Fine-Tuning (XTTS GPT Training):\n"
-            f"   Ready: {'Yes' if t_ft['ready'] else 'No'}\n"
-            f"   Min HW: {t_ft['minimum']}\n"
-        )
-        if t_ft["notes"]:
-            msg += "   Notes: " + "; ".join(t_ft["notes"]) + "\n"
-        msg += "\nRun `tts-cli train-voice` or call the MCP `train_custom_voice` tool to fine-tune."
-        QMessageBox.information(self, "Voice Training & Hardware", msg)
+        self._tabs.setCurrentIndex(2)
 
+    # ----------------------------------------------------------------- #
+    # Video voiceover studio tab actions
+    # ----------------------------------------------------------------- #
+    def _on_copy_to_video_tab(self) -> None:
+        self._video_script_edit.setPlainText(self._text_edit.toPlainText())
+
+    def _on_pick_video_output_dir(self) -> None:
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select output folder", self._video_dir_edit.text()
+        )
+        if folder:
+            self._video_dir_edit.setText(folder)
+
+    def _on_pick_target_mp4(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select target video", "", "Video files (*.mp4 *.mov *.webm);;All files (*)"
+        )
+        if path:
+            self._video_mp4_edit.setText(path)
+
+    def on_render_video_voiceover(self) -> None:
+        script = self._video_script_edit.toPlainText().strip()
+        if not script:
+            self.error("Enter a storyboard script (or copy it from Speech Studio).")
+            return
+
+        voice = self.selected_voice()
+        engine = self.current_engine()
+        kwargs: dict[str, _t.Any] = {
+            "script": script,
+            "output_dir": self._video_dir_edit.text().strip() or get_outputs_dir(),
+            "output_name": self._video_name_edit.text().strip() or "voiceover",
+            "audio_format": self._video_fmt_combo.currentText(),
+            "fps": int(self._video_fps_combo.currentData() or 30),
+            "default_engine": engine.id,
+            "default_language": self._selected_language(),
+            "default_speed": self._current_speed(),
+            "default_pause_ms": int(self._video_pause_spin.value()),
+            "trim_silence_flag": self._chk_trim.isChecked(),
+            "normalize_loudness_flag": self._chk_normalize.isChecked(),
+            "video_path": self._video_mp4_edit.text().strip() or None,
+            "burn_subtitles": self._chk_burn_subs.isChecked(),
+        }
+        if voice is not None:
+            if voice.id.startswith("profile:"):
+                kwargs["default_voice_profile"] = voice.id[len("profile:") :]
+            elif voice.kind == "sample":
+                kwargs["default_reference_audio"] = voice.id
+            else:
+                kwargs["default_voice_id"] = voice.id
+
+        self._status.setText("Rendering multi-scene video voiceover\u2026")
+        self._set_busy(True)
+        worker = _VideoVoiceoverWorker(kwargs)
+        worker.succeeded.connect(self._on_video_done)
+        worker.failed.connect(self._on_synth_failed)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+        self._worker = worker
+
+    def _on_video_done(self, data: dict) -> None:
+        self._set_busy(False)
+        self._video_master_path = data.get("master_audio_path")
+        self._btn_play_video_master.setEnabled(bool(self._video_master_path))
+        lines = [
+            f"Master Audio: {data['master_audio_path']} ({data['total_duration_s']}s / {data['total_frames']} frames @ {data['fps']} fps)",
+            f"SRT Captions: {data['srt_path']}",
+            f"VTT Captions: {data['vtt_path']}",
+            f"Timeline JSON: {data['timeline_json_path']}",
+        ]
+        if data.get("muxed_video_path"):
+            lines.append(f"Muxed Video: {data['muxed_video_path']}")
+        lines.append("\nScenes:")
+        for sc in data.get("scenes", []):
+            lines.append(
+                f"  - [{sc['id']}] {sc['start_ms']}..{sc['end_ms']} ms "
+                f"(frames {sc['start_frame']}..{sc['end_frame']})"
+            )
+        self._video_result_view.setPlainText("\n".join(lines))
+        self._status.setText("Video voiceover rendered.")
+
+    def _on_play_video_master(self) -> None:
+        if self._video_master_path and os.path.isfile(self._video_master_path):
+            self._start_playback(self._video_master_path)
+
+    # ----------------------------------------------------------------- #
+    # Speech studio synthesis & playback
+    # ----------------------------------------------------------------- #
     def _validation_error(self) -> _t.Optional[str]:
         if not self._text_edit.toPlainText().strip():
             return "The text is empty. Add some text or load a .txt file."
@@ -789,6 +1305,7 @@ class MainWindow(QMainWindow):
             speed=self._current_speed(),
             generate_subtitles=generate_subtitles,
             normalize_loudness=self._chk_normalize.isChecked(),
+            trim_silence=self._chk_trim.isChecked(),
         )
         worker.succeeded.connect(on_done)
         worker.failed.connect(on_failed)
@@ -824,7 +1341,7 @@ class MainWindow(QMainWindow):
         self._status.setText("Playing\u2026")
 
     # ----------------------------------------------------------------- #
-    # Player signals
+    # Player signals & scrubbing
     # ----------------------------------------------------------------- #
     def _on_position(self, ms: int) -> None:
         if not self._scrubbing:
@@ -853,9 +1370,6 @@ class MainWindow(QMainWindow):
     def _on_player_error(self, message: str) -> None:
         self.error(message)
 
-    # ----------------------------------------------------------------- #
-    # Progress slider scrubbing
-    # ----------------------------------------------------------------- #
     def _start_scrub(self) -> None:
         self._scrubbing = True
 
@@ -867,14 +1381,18 @@ class MainWindow(QMainWindow):
     # Misc helpers
     # ----------------------------------------------------------------- #
     def _set_busy(self, busy: bool) -> None:
+        self._busy_bar.setRange(0, 0 if busy else 1)
+        self._busy_bar.setValue(0)
         self._btn_play.setEnabled(not busy)
         self._btn_export.setEnabled(not busy)
+        self._btn_render_video.setEnabled(not busy)
         self._btn_sample.setEnabled(not busy)
         self._btn_record.setEnabled(not busy)
         if not busy:
             self._on_xtts_target_changed()
         else:
             self._btn_save_profile.setEnabled(False)
+            self._btn_delete_profile.setEnabled(False)
 
     def _new_tmp_path(self, extension: str) -> str:
         fd, path = tempfile.mkstemp(suffix=extension, prefix="tts_")
@@ -906,7 +1424,8 @@ def _fmt(ms: int) -> str:
 def main() -> int:
     """Create the QApplication, show the window, and run the event loop."""
     app = QApplication(sys.argv)
-    app.setApplicationName("Text-to-Speech")
+    app.setStyle("Fusion")
+    app.setApplicationName("Voice Studio")
     try:
         window = MainWindow()
     except TtsError as exc:

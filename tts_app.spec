@@ -18,6 +18,7 @@ hiddenimports = [
     "tts_app.video_pipeline",
     "tts_app.mcp_server",
     "tts_app.cli",
+    "tts_app.theme",
     "tts_app.gui",
 ]
 # edge-tts uses aiohttp/async with dynamically loaded submodules.
